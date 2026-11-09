@@ -1,0 +1,67 @@
+services:
+  postgres:
+    image: docker.io/library/postgres:17-alpine
+    environment:
+      POSTGRES_DB: loyalty
+      POSTGRES_USER: loyalty
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loyalty -d loyalty"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Containerfile
+    environment:
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: postgres://loyalty:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/loyalty?sslmode=disable
+      AUTH_SECRET: ${AUTH_SECRET:?Set AUTH_SECRET in .env}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?Set ADMIN_TOKEN in .env}
+      CONNECTOR_URL: ${CONNECTOR_CONTAINER_URL:-http://connector:8081}
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN:?Set CONNECTOR_TOKEN in .env}
+      WEBHOOK_TOKEN: ${WEBHOOK_TOKEN:?Set WEBHOOK_TOKEN in .env}
+      TOKEN_TTL: ${TOKEN_TTL:-24h}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      CONNECTOR_TIMEOUT: ${CONNECTOR_TIMEOUT:-5s}
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      connector:
+        condition: service_started
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  connector:
+    build:
+      context: ../washing_connector
+      dockerfile: Containerfile
+    environment:
+      HTTP_ADDR: ":8081"
+      DATABASE_URL: postgres://loyalty:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/loyalty?sslmode=disable
+      CONNECTOR_TOKEN: ${CONNECTOR_TOKEN:?Set CONNECTOR_TOKEN in .env}
+      WEBHOOK_TOKEN: ${WEBHOOK_TOKEN:?Set WEBHOOK_TOKEN in .env}
+      LOYALTY_URL: http://api:8080
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

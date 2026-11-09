@@ -1,0 +1,98 @@
+name: Test and publish Podman image
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: loyalty
+          POSTGRES_PASSWORD: loyalty
+          POSTGRES_DB: loyalty_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd 'pg_isready -U loyalty -d loyalty_test'
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://loyalty:loyalty@localhost:5432/loyalty_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: go.sum
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal)"
+      - run: go mod verify
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      - run: CGO_ENABLED=0 go build -trimpath -o bin/loyalty ./cmd/loyalty
+
+  image:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Podman if needed
+        run: |
+          if ! command -v podman >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y podman
+          fi
+          podman --version
+      - name: Set image name
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: echo "name=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Build OCI image with Podman
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          podman build --format oci -f Containerfile \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$IMAGE:sha-$GITHUB_SHA" .
+      - name: Publish to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          podman push "$IMAGE:sha-$GITHUB_SHA"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            podman tag "$IMAGE:sha-$GITHUB_SHA" "$IMAGE:$GITHUB_REF_NAME"
+            podman push "$IMAGE:$GITHUB_REF_NAME"
+          elif [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ]; then
+            podman tag "$IMAGE:sha-$GITHUB_SHA" "$IMAGE:latest"
+            podman push "$IMAGE:latest"
+          fi
+      - name: Log out of GHCR
+        if: always() && github.event_name != 'pull_request'
+        run: podman logout ghcr.io || true
